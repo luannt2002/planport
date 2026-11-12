@@ -19,6 +19,10 @@ import (
 	"time"
 )
 
+// refreshRetry spaces refreshes after a transient failure while the token is still valid: each
+// try holds the lock up to the refresh timeout; a var for tests.
+var refreshRetry = 30 * time.Second
+
 // Store is one credential file: where the token lives, its field names and
 // how to refresh it.
 type Store struct {
@@ -37,6 +41,8 @@ type Store struct {
 	mu       sync.Mutex // one lock per credential file
 	client   *http.Client
 	rejected string // refresh token the server rejected for good: never resend
+	failed   string // refresh token whose refresh failed at failedAt
+	failedAt time.Time
 	unsaved  *unsaved
 }
 
@@ -100,12 +106,16 @@ func (s *Store) Get(ctx context.Context) (Credentials, error) {
 	if refreshTok == "" {
 		return Credentials{}, fmt.Errorf("token is expiring and has no %s; log in again with the CLI", s.RefreshKey)
 	}
+	if refreshTok == s.failed && time.Since(s.failedAt) < refreshRetry && time.Until(expiry) > 0 {
+		return current, nil // a new login puts another token in the file and skips the wait
+	}
 	// Not cancelled with the client (only by the refresh timeout): the server
 	// may have rotated the token, and dropping the reply strands a dead one.
 	fresh, err := s.refresh(context.WithoutCancel(ctx), refreshTok)
 	if err != nil {
 		if left := time.Until(expiry); left > 0 {
-			// The current token is still valid: use it; the next request retries.
+			// The current token is still valid: use it; retry after refreshRetry.
+			s.failed, s.failedAt = refreshTok, time.Now()
 			log.Printf("refresh %s failed, using current token valid for %s: %v", s.Path, left.Round(time.Second), err)
 			return current, nil
 		}
@@ -206,6 +216,12 @@ func (s *Store) save(path string, doc map[string]any, tok map[string]any) error 
 		os.Remove(tmp)
 		return fmt.Errorf("replace %s: %w", path, err)
 	}
+	// Persist the rename too: after a power cut the old file (its refresh token
+	// already rotated, so dead) could come back and log the account out.
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = d.Sync()
+		d.Close()
+	}
 	return nil
 }
 
@@ -244,8 +260,11 @@ func (s *Store) refresh(ctx context.Context, refreshToken string) (refreshedToke
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return refreshedToken{}, fmt.Errorf("refresh %s returned invalid JSON (HTTP %d): %w", s.RefreshURL, resp.StatusCode, err)
 	}
-	if resp.StatusCode != http.StatusOK || out.AccessToken == "" {
-		return refreshedToken{}, fmt.Errorf("refresh rejected (HTTP %d); log in again with the CLI", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK { // 429/5xx: transient, retried later; no new login needed
+		return refreshedToken{}, fmt.Errorf("refresh failed (HTTP %d)", resp.StatusCode)
+	}
+	if out.AccessToken == "" {
+		return refreshedToken{}, fmt.Errorf("refresh reply has no %s; log in again with the CLI", s.AccessKey)
 	}
 	out.RefreshToken = cmp.Or(out.RefreshToken, refreshToken)
 	return out, nil

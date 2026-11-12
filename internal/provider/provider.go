@@ -5,6 +5,7 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -105,7 +106,8 @@ func (m ChatMessage) Parts() ([]Part, error) {
 		return nil, nil
 	}
 	var s string
-	if json.Unmarshal(m.Content, &s) == nil {
+	// An array is never a string: skip that attempt, it would scan the whole (maybe 60 MB) content twice.
+	if !bytes.HasPrefix(bytes.TrimLeft(m.Content, " \t\r\n"), []byte("[")) && json.Unmarshal(m.Content, &s) == nil {
 		return []Part{{Type: PartText, Text: s}}, nil
 	}
 	var raw []struct {

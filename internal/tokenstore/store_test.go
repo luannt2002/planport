@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -413,5 +414,71 @@ func TestUnsavedStaysWithItsFile(t *testing.T) {
 	}
 	if _, tok := readDoc(t, b); tok["refresh_token"] != "rtB" {
 		t.Fatalf("file B must not change: %v", tok["refresh_token"])
+	}
+}
+
+// After a transient refresh failure (here 503) with the token still valid, Gets
+// use it without refreshing for refreshRetry, then retry; a new login in the
+// file or an expired token is refreshed at once.
+func TestTransientRefreshFailureWaits(t *testing.T) {
+	defer func(old time.Duration) { refreshRetry = old }(refreshRetry)
+	refreshRetry = time.Second // the 7 Gets below must fit in it, even on a loaded machine
+	var n atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	valid := jwtAt(time.Now().Add(2 * time.Minute)) // < 5m Margin, so refresh is due
+	path := writeFile(t, creds(valid, "rt0"))
+	s := codexStore(path, srv.URL)
+	get := func() {
+		if c, err := s.Get(context.Background()); err != nil || c.AccessToken != valid {
+			t.Errorf("Get must return the still-valid token: %+v %v", c, err)
+		}
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			get()
+		}()
+	}
+	wg.Wait()
+	get()
+	get()
+	if n.Load() != 1 {
+		t.Fatalf("7 Gets within refreshRetry must refresh once, server got %d", n.Load())
+	}
+	time.Sleep(refreshRetry)
+	get()
+	if n.Load() != 2 {
+		t.Fatalf("after refreshRetry the refresh must be retried: server got %d (want 2)", n.Load())
+	}
+	os.WriteFile(path, []byte(creds(valid, "rt-relogin")), 0600) // new login
+	get()
+	if n.Load() != 3 {
+		t.Fatalf("a new token in the file must be refreshed at once: server got %d (want 3)", n.Load())
+	}
+	os.WriteFile(path, []byte(creds(expired(), "rt-relogin")), 0600) // same refresh token, access token now expired
+	if _, err := s.Get(context.Background()); err == nil || n.Load() != 4 {
+		t.Fatalf("an expired token must be refreshed even within refreshRetry: err=%v, server got %d (want 4)", err, n.Load())
+	}
+}
+
+// A transient refresh failure (429/5xx, even with a JSON body) must not tell the
+// operator to log in again: only a rejected token (400/401/403) needs that.
+func TestTransientRefreshErrorNoRelogin(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(status)
+			fmt.Fprint(w, `{"error":"busy"}`)
+		}))
+		_, err := codexStore(writeFile(t, creds(expired(), "rt0")), srv.URL).Get(context.Background())
+		srv.Close()
+		if err == nil || strings.Contains(err.Error(), "log in again") || !strings.Contains(err.Error(), fmt.Sprint(status)) {
+			t.Fatalf("HTTP %d: want an error naming the status without \"log in again\", got %v", status, err)
+		}
 	}
 }

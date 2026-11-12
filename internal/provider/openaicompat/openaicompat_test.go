@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -279,5 +280,31 @@ func TestTimeoutIsDeadline(t *testing.T) {
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Errorf("%s: want error matching context.DeadlineExceeded, got %v", name, err)
 		}
+	}
+}
+
+// Messages reach the upstream unchanged: role and content only, any content
+// JSON (unicode, HTML characters, inner whitespace) and no content key when
+// the client sent none.
+func TestMessagesPassThrough(t *testing.T) {
+	srv, got := upstream(http.StatusOK, "", "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	defer srv.Close()
+	user := `[ {"type": "text", "text": "<b>café — 世界</b> & \"q\""} ,
+	  {"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}} ]`
+	req := provider.ChatRequest{Model: "m", Messages: []provider.ChatMessage{
+		{Role: "system", Content: json.RawMessage(`"be <brief>"`)},
+		{Role: "assistant"},
+		{Role: "user", Content: json.RawMessage(user)},
+		{Role: "x\"<y>\\\n", Content: json.RawMessage(`"z"`)},
+	}}
+	if _, _, _, err := collect(newProvider(t, srv.URL, "k"), req); err != nil {
+		t.Fatal(err)
+	}
+	var want []any
+	if err := json.Unmarshal([]byte(`[{"role":"system","content":"be <brief>"},{"role":"assistant"},{"role":"user","content":`+user+`},{"role":"x\"<y>\\\n","content":"z"}]`), &want); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.body["messages"], want) {
+		t.Fatalf("messages changed on the way (or the body was not JSON):\n got %v\nwant %v", got.body["messages"], want)
 	}
 }

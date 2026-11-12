@@ -62,6 +62,9 @@ All settings come from env / `.env` ([.env.example](.env.example)), read only in
 - More accounts or vendors need env only: add the name to `PLANPORT_PROVIDERS`
   with its `TYPE` and `CRED_FILE` (plus `BASE_URL` for a new `openai_compat`
   vendor).
+- Fixed limits, not settings: at most 2 request bodies over 8 MiB (or without
+  `Content-Length`) are handled at once, later ones wait; a body not received
+  within 5 minutes gets 408.
 
 ## Network access
 
@@ -87,10 +90,12 @@ Refresh tokens rotate, so two parties refreshing one token log one of them out.
   in-process only, so prefer accounts the Codex CLI is not using at the same time.
 - planport refreshes when the access token (JWT `exp`) is within
   `REFRESH_MARGIN` and writes it back to the file it read (temp file, fsync,
-  rename, mode 600).
+  rename, directory fsync, mode 600).
 - A refresh finishes even if the client cancels. A failed refresh falls back to
-  the old token while it is valid. A token that cannot be saved stays in memory
-  and is saved later — fix the disk before stopping planport.
+  the old token while it is valid, and the refresh is retried at most every
+  30 s meanwhile (a 429/5xx does not ask for a new login). A token that cannot be
+  saved stays in memory and is saved later — fix the disk before stopping
+  planport.
 - A rejected refresh token (400/401/403) is not resent until the file changes:
   run `codex login`.
 - `openai_compat` keys are re-read from their file on every request.

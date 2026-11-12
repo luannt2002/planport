@@ -4,6 +4,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -14,6 +15,8 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -25,16 +28,28 @@ import (
 // maxChatBody bounds memory (bodies are read whole) yet fits a few base64 files; a var for tests.
 var maxChatBody int64 = 64 << 20
 
+// Bodies over largeBody (or of unknown size) cost several times their size in RAM until the
+// reply ends, so at most largeSlots of them are handled at once.
+const (
+	largeBody  = 8 << 20
+	largeSlots = 2
+)
+
+// bodyReadTimeout bounds reading the body only: a slow sender must not pin the connection (and
+// shutdown), while a ReadTimeout would also cut long streams; a var for tests.
+var bodyReadTimeout = 5 * time.Minute
+
 // Server is the http.Handler for the configured providers.
 type Server struct {
 	providers provider.Registry
 	apiKey    string
 	reqCount  atomic.Int64
+	large     chan struct{} // slots for large bodies
 }
 
 // New returns a Server; an empty apiKey disables the key check.
 func New(providers provider.Registry, apiKey string) *Server {
-	return &Server{providers: providers, apiKey: apiKey}
+	return &Server{providers: providers, apiKey: apiKey, large: make(chan struct{}, largeSlots)}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -98,17 +113,54 @@ func loopbackHost(hostport string) bool {
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
+	tooLarge := func() {
+		writeErr(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("body too large (max %d MiB)", maxChatBody>>20), "invalid_request_error")
+	}
+	if r.ContentLength > maxChatBody {
+		// Refuse a declared oversize body without storing it (or taking a slot). A client already sending
+		// gets it drained, not kept (bounded), so it reads the 413 instead of a reset; one that waits for
+		// "100 Continue" gets the 413 at once and never uploads.
+		if !strings.EqualFold(r.Header.Get("Expect"), "100-continue") {
+			_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(bodyReadTimeout))
+			_, _ = io.CopyN(io.Discard, r.Body, 2*maxChatBody)
+		}
+		tooLarge()
+		return
+	}
+	if r.ContentLength < 0 || r.ContentLength > largeBody {
+		select {
+		case s.large <- struct{}{}:
+		case <-r.Context().Done():
+			return // e.g. an HTTP/2 client gone; HTTP/1 notices a gone client only after the body is read (Shutdown does not cancel it)
+		}
+		// Free the slot, then hand the body's pages back to the OS without delaying the reply.
+		defer func() { <-s.large; go debug.FreeOSMemory() }()
+	}
 	// Read the whole body first: Unmarshal rejects trailing data that a Decoder
 	// would silently ignore, and trailing data past the cap becomes a 413.
-	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxChatBody))
+	var body bytes.Buffer
+	// Sized from the declared length only with a slot: otherwise idle clients could pin that much each.
+	if r.ContentLength > largeBody {
+		body.Grow(int(r.ContentLength) + bytes.MinRead) // + MinRead: ReadFrom regrows a full buffer before it sees EOF
+	}
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Now().Add(bodyReadTimeout)) // unsupported (e.g. ResponseRecorder): no deadline
+	_, err := body.ReadFrom(http.MaxBytesReader(w, r.Body, maxChatBody))
+	if err == nil { // after an error it stays, so the server's discard of the unread rest cannot hang
+		_ = rc.SetReadDeadline(time.Time{}) // a stream must not inherit it (HTTP/1 also clears it at EOF)
+	}
 	var tooBig *http.MaxBytesError
-	if errors.As(err, &tooBig) {
-		writeErr(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("body too large (max %d MiB)", maxChatBody>>20), "invalid_request_error")
+	if errors.As(err, &tooBig) { // undeclared (chunked) size past the cap
+		tooLarge()
+		return
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		writeErr(w, http.StatusRequestTimeout, "request body read timed out", "invalid_request_error")
 		return
 	}
 	var req provider.ChatRequest
 	if err == nil {
-		err = json.Unmarshal(raw, &req)
+		err = json.Unmarshal(body.Bytes(), &req)
 	}
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error(), "invalid_request_error")
@@ -132,6 +184,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 }
 
 func serveBuffered(w http.ResponseWriter, r *http.Request, p provider.Provider, req provider.ChatRequest, reqID string) {
+	start := time.Now()
 	var text strings.Builder
 	var usage provider.Usage
 	finish := "stop" // replaced when the backend reports truncation
@@ -146,7 +199,7 @@ func serveBuffered(w http.ResponseWriter, r *http.Request, p provider.Provider, 
 		return nil
 	})
 	if err != nil {
-		log.Printf("chat %s %s/%s: %v", reqID, p.ID(), req.Model, err)
+		log.Printf("chat %s %s/%q: %v", reqID, p.ID(), req.Model, err) // %q: the model is client text
 		writeProviderErr(w, err, p.ID(), reqID, true)
 		return
 	}
@@ -156,6 +209,7 @@ func serveBuffered(w http.ResponseWriter, r *http.Request, p provider.Provider, 
 		Choices: []choiceOut{{Message: messageOut{Role: "assistant", Content: text.String()}, FinishReason: finish}},
 		Usage:   usage,
 	})
+	log.Printf("chat %s %s/%q done in %s (usage %+v)", reqID, p.ID(), req.Model, time.Since(start).Round(time.Millisecond), usage)
 }
 
 func serveStream(w http.ResponseWriter, r *http.Request, p provider.Provider, req provider.ChatRequest, reqID string) {
@@ -200,7 +254,7 @@ func serveStream(w http.ResponseWriter, r *http.Request, p provider.Provider, re
 		return
 	}
 	if err != nil {
-		log.Printf("chat %s %s/%s: %v", reqID, p.ID(), req.Model, err)
+		log.Printf("chat %s %s/%q: %v", reqID, p.ID(), req.Model, err) // %q: the model is client text
 		if !started {
 			writeProviderErr(w, err, p.ID(), reqID, true)
 			return
@@ -213,7 +267,7 @@ func serveStream(w http.ResponseWriter, r *http.Request, p provider.Provider, re
 	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil || rc.Flush() != nil {
 		return
 	}
-	log.Printf("chat %s %s/%s done in %s (usage %+v)", reqID, p.ID(), req.Model, time.Since(start).Round(time.Millisecond), usage)
+	log.Printf("chat %s %s/%q done in %s (usage %+v)", reqID, p.ID(), req.Model, time.Since(start).Round(time.Millisecond), usage)
 }
 
 // writeChunk writes one "data:" event; an empty finish means finish_reason null.

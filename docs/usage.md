@@ -73,7 +73,9 @@ A `user` message's `content` may be an array mixing any number of parts:
 Put each question right before the image or file it is about. Images and files
 belong in `user` messages (`codex` and `claude_cli` reject them elsewhere;
 `openai_compat` forwards as-is). Bodies are capped at 64 MiB (413); large images
-cost many tokens, so shrink them. Send local files through stdin to avoid the
+cost many tokens, so shrink them. At most 2 bodies over 8 MiB (or sent without
+`Content-Length`) are handled at once; later ones wait their turn. A body not
+received within 5 minutes gets 408. Send local files through stdin to avoid the
 shell's argument size limit:
 
 ```bash
@@ -130,6 +132,7 @@ Bodies are `{"error": {"message": "…", "type": "…"}}`.
 | 403 | `forbidden` | browser request, or non-loopback `Host` without a server key | call from a program |
 | 404 | `not_found` | unknown provider (valid ones listed) or route | fix the name / URL |
 | 405 | `invalid_request_error` | wrong method | |
+| 408 | `invalid_request_error` | request body not received within 5 minutes | send it faster or smaller |
 | 413 | `invalid_request_error` | body over 64 MiB | shrink or split |
 | 429 | `rate_limit_error` | account hit its usage limit | wait `Retry-After` seconds (when sent) or use another provider |
 | 501 | `not_implemented` | model listing on a type that cannot list | |

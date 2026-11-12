@@ -61,7 +61,6 @@ func (p *Provider) StreamChat(ctx context.Context, req provider.ChatRequest, emi
 	}
 	payload := map[string]any{
 		"model":          req.Model,
-		"messages":       req.Messages,
 		"stream":         true,
 		"stream_options": map[string]bool{"include_usage": true},
 	}
@@ -75,10 +74,11 @@ func (p *Provider) StreamChat(ctx context.Context, req provider.ChatRequest, emi
 	if err != nil {
 		return err
 	}
-	body, err := json.Marshal(payload)
+	head, err := json.Marshal(payload)
 	if err != nil {
 		return &provider.RequestError{Err: err}
 	}
+	body := appendMessages(head, req.Messages)
 	// Cap the whole call with a context (as in codex) so the error matches context.DeadlineExceeded.
 	ctx, cancel := context.WithTimeout(ctx, p.cfg.Timeout)
 	defer cancel()
@@ -104,6 +104,34 @@ func (p *Provider) StreamChat(ctx context.Context, req provider.ChatRequest, emi
 		}
 	}
 	return err
+}
+
+// appendMessages adds "messages" (role + content) to the marshalled object head. Content is
+// spliced in as received: it is valid JSON (Parts parsed it), and Marshal would rescan and
+// copy it twice — a large share of a big upload's CPU.
+func appendMessages(head []byte, msgs []provider.ChatMessage) []byte {
+	n := len(head) + 16
+	for _, m := range msgs {
+		n += len(m.Role) + len(m.Content) + 32
+	}
+	b := bytes.NewBuffer(make([]byte, 0, n))
+	b.Write(head[:len(head)-1]) // drop "}"
+	b.WriteString(`,"messages":[`)
+	for i, m := range msgs {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		role, _ := json.Marshal(m.Role) // a string: cannot fail
+		b.WriteString(`{"role":`)
+		b.Write(role)
+		if len(m.Content) > 0 { // omitted when absent, as before
+			b.WriteString(`,"content":`)
+			b.Write(m.Content)
+		}
+		b.WriteByte('}')
+	}
+	b.WriteString("]}")
+	return b.Bytes()
 }
 
 // Models lists upstream models via the standard GET {BASE_URL}/models and
